@@ -1,6 +1,5 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 import os
-import re
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.output_parsers import PydanticOutputParser
@@ -13,6 +12,9 @@ import json
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+import re
+from langchain_community.document_transformers import Html2TextTransformer
+from langchain.docstore.document import Document
 
 # Initialize Gemini LLM
 os.environ["GOOGLE_API_KEY"] = "REMOVED"
@@ -30,7 +32,7 @@ class GraphState(BaseModel):
 
     question: str = None
     route: str = None
-    response: str = None
+    response: Union[str, dict] = None
 
 
 # --- 2. Define Sub-Committee Tools and Models ---
@@ -91,22 +93,54 @@ async def analyzer_agent(state: GraphState):
         response = requests.get(url)
         response.raise_for_status()  # Raise an exception for bad status codes
 
-        soup = BeautifulSoup(response.content, "html.parser")
-        document_extensions = [".pdf", ".doc", ".docx", ".txt", ".csv", ".xls", ".xlsx", ".pptx"]
-        document_links = []
+        # Resolve relative URLs in the HTML
+        soup = BeautifulSoup(response.text, "html.parser")
         for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            full_url = urljoin(url, href)  # Resolve relative URLs
-            
-            if any(full_url.lower().endswith(ext) for ext in document_extensions):
-                document_links.append(full_url)
-        if document_links:
-           return GraphState(question=state.question, response=f"Document files found: {document_links}")
-        else:
-           return GraphState(question=state.question, response="No document files were found on the webpage.")
+            a_tag["href"] = urljoin(url, a_tag["href"])
+
+        # Convert the modified HTML to markdown using Html2TextTransformer
+        transformer = Html2TextTransformer(ignore_links=False)
+        markdown_content = transformer.transform_documents([Document(page_content=str(soup))])[0].page_content
+
+        print("Markdown content: ", markdown_content)
+
+        # Prepare LLM prompt for metadata extraction
+        template = """You are a helpful assistant skilled in analyzing web page content. 
+        The following is the markdown version of a webpage. Your task is to extract metadata for any document files listed on the page.
+        Metadata includes:
+        - File name or description
+        - URL
+        - Date (if available)
+        - Type (if available)
+        - Size (if available)
+
+        Use the markdown content below to extract this information. Provide the output as a JSON array of objects where each object represents a document with its metadata.
+
+        Markdown content:
+        {markdown_content}
+
+        Extracted metadata:"""
+
+        prompt = ChatPromptTemplate.from_template(template)
+        prompt_value = await prompt.ainvoke({"markdown_content": markdown_content})
+        messages = prompt_value.to_messages()
+        formatted_messages = [
+            {"role": m.role if hasattr(m, "role") else "user", "content": m.content}
+            for m in messages
+        ]
+
+        # Send prompt to the LLM
+        response = await llm.ainvoke(formatted_messages)
+
+        # Parse and return the LLM output
+        return GraphState(
+            question=state.question,
+            response=response.content
+        )
 
     except requests.exceptions.RequestException as e:
         return GraphState(question=state.question, response=f"Error fetching URL: {e}")
+
 
 
 # Sub-Committee 4: Summarizer
@@ -145,7 +179,7 @@ router_prompt = ChatPromptTemplate.from_messages(
         The following sub-committees are available:
         - assistant: For general questions that don't require any specialized tool.
         - web_search: For questions requiring up-to-date information from the web.
-        - analyzer: For questions involving analysis of data or text, particularly listing files from URL.
+        - analyzer: For questions involving analysis of data or text, particularly listing files from URL with all the metadata available.
         - summarizer: For questions focused on summarizing text.
         
         Given the user question, identify which of the sub-committees would be best suited to answer it.
@@ -244,7 +278,8 @@ async def main():
             result = await run_pipeline(question)
             print(f"\n{result}\n")
     finally:
-        await asyncio.sleep(0.5)  # Give grpc time to shutdown
+        await asyncio.sleep(1)  # Give grpc time to shutdown
+
 
 if __name__ == "__main__":
     asyncio.run(main())
