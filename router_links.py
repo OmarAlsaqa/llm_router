@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Union
 import os
+import grpc
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.output_parsers import PydanticOutputParser
@@ -12,12 +13,19 @@ import json
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 import re
 from langchain_community.document_transformers import Html2TextTransformer
 from langchain.docstore.document import Document
 
+import warnings
+
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="grpc")
+
 # Initialize Gemini LLM
 os.environ["GOOGLE_API_KEY"] = "REMOVED"
+os.environ["JINA_API_KEY"] = "REMOVED"
 api_key = os.environ.get("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("Please set the GOOGLE_API_KEY environment variable.")
@@ -89,20 +97,31 @@ async def analyzer_agent(state: GraphState):
         return GraphState(question=state.question, response="No URL found in the question.")
 
     url = url_match.group(0)
+
     try:
-        response = requests.get(url)
+        # Fetch markdown content using Jina AI
+        full_url = f"https://r.jina.ai/{url}"
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('JINA_API_KEY')}",
+            "Content-Type": "application/json",
+            "X-Return-Format": "markdown"
+        }
+
+        response = requests.get(full_url, headers=headers)
         response.raise_for_status()  # Raise an exception for bad status codes
 
-        # Resolve relative URLs in the HTML
-        soup = BeautifulSoup(response.text, "html.parser")
+        markdown_content = response.text
+
+        print("Markdown content: ", markdown_content)
+
+        # Enhance markdown content by reintegrating URLs using BeautifulSoup
+        soup = BeautifulSoup(requests.get(url).text, "html.parser")
         for a_tag in soup.find_all("a", href=True):
             a_tag["href"] = urljoin(url, a_tag["href"])
 
-        # Convert the modified HTML to markdown using Html2TextTransformer
-        transformer = Html2TextTransformer(ignore_links=False)
-        markdown_content = transformer.transform_documents([Document(page_content=str(soup))])[0].page_content
-
-        print("Markdown content: ", markdown_content)
+        for link in soup.find_all("a", href=True):
+            if link.get("href") not in markdown_content:
+                markdown_content += f"\n[Link]({link.get('href')})"
 
         # Prepare LLM prompt for metadata extraction
         template = """You are a helpful assistant skilled in analyzing web page content. 
@@ -140,6 +159,7 @@ async def analyzer_agent(state: GraphState):
 
     except requests.exceptions.RequestException as e:
         return GraphState(question=state.question, response=f"Error fetching URL: {e}")
+
 
 
 
@@ -274,11 +294,14 @@ async def main():
         while True:
             question = input("Enter your question (or 'exit' to quit): ")
             if question.lower() == "exit":
+                print("Shutting down...")
                 break
             result = await run_pipeline(question)
             print(f"\n{result}\n")
     finally:
-        await asyncio.sleep(1)  # Give grpc time to shutdown
+        # Explicitly clean up gRPC resources
+        await grpc.aio._shutdown_all()  # Shutdown all gRPC async resources
+        await asyncio.sleep(0.5)  # Allow grpc-aio to clean up properly
 
 
 if __name__ == "__main__":
