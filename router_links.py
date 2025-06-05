@@ -24,8 +24,8 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="grpc")
 
 # Initialize Gemini LLM
-os.environ["GOOGLE_API_KEY"] = "REMOVED"
-os.environ["JINA_API_KEY"] = "REMOVED"
+os.environ["GOOGLE_API_KEY"] = "***"
+os.environ["JINA_API_KEY"] = "***"
 api_key = os.environ.get("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("Please set the GOOGLE_API_KEY environment variable.")
